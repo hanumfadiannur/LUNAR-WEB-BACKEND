@@ -43,6 +43,23 @@ class AuthController extends Controller
         return $token['access_token'];
     }
 
+    private function formatValue($value)
+    {
+        if (is_int($value)) {
+            return ['integerValue' => (string)$value];
+        } elseif (is_string($value)) {
+            return ['stringValue' => $value];
+        } elseif (is_bool($value)) {
+            return ['booleanValue' => $value];
+        } elseif ($value === null) {
+            return ['nullValue' => null];
+        } elseif ($value instanceof \DateTime) {
+            return ['timestampValue' => $value->format('Y-m-d\TH:i:s.u\Z')];
+        }
+
+        throw new \Exception('Unsupported data type');
+    }
+
     private function saveToFirestore($path, array $data, $accessToken, $method = 'PATCH')
     {
         $url = "https://firestore.googleapis.com/v1/projects/{$this->projectId}/databases/(default)/documents/{$path}";
@@ -97,8 +114,6 @@ class AuthController extends Controller
 
         return json_decode($response->getBody(), true);
     }
-
-
 
     // Register user
     public function register(Request $request)
