@@ -43,23 +43,6 @@ class AuthController extends Controller
         return $token['access_token'];
     }
 
-    private function formatValue($value)
-    {
-        if (is_int($value)) {
-            return ['integerValue' => (string)$value];
-        } elseif (is_string($value)) {
-            return ['stringValue' => $value];
-        } elseif (is_bool($value)) {
-            return ['booleanValue' => $value];
-        } elseif ($value === null) {
-            return ['nullValue' => null];
-        } elseif ($value instanceof \DateTime) {
-            return ['timestampValue' => $value->format('Y-m-d\TH:i:s.u\Z')];
-        }
-
-        throw new \Exception('Unsupported data type');
-    }
-
     private function saveToFirestore($path, array $data, $accessToken, $method = 'PATCH')
     {
         $url = "https://firestore.googleapis.com/v1/projects/{$this->projectId}/databases/(default)/documents/{$path}";
@@ -222,7 +205,7 @@ class AuthController extends Controller
             'lastPeriodEndDate'   => 'required|date|after_or_equal:lastPeriodStartDate',
         ]);
 
-        // Ambil uid dari user yang sudah login (pastikan middleware auth sudah pasang)
+        // Ambil uid dari user yang udah login (pastiin middleware auth udah pasang)
         $uid = $request->input('firebase_uid');
 
         if (!$uid) {
