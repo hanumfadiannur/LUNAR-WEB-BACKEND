@@ -62,6 +62,52 @@ class UserController extends Controller
     }
 
     /**
+     * Update user's full name in Firestore.
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function updateFullName(Request $request)
+    {
+        // Validasi input
+        $validator = Validator::make($request->all(), [
+            'firebase_uid' => 'required|string',
+            'fullname' => 'required|string|max:100',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['error' => $validator->errors()->first()], 400);
+        }
+
+        $uid = $request->get('firebase_uid');
+        $newFullName = $request->get('fullname');
+
+        $url = "https://firestore.googleapis.com/v1/projects/{$this->projectId}/databases/(default)/documents/users/{$uid}?updateMask.fieldPaths=fullname";
+
+        $client = new Client();
+
+        try {
+            $response = $client->request('PATCH', $url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->accessToken,
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => [
+                    'fields' => [
+                        'fullname' => [
+                            'stringValue' => $newFullName,
+                        ],
+                    ],
+                ],
+            ]);
+
+            return response()->json(['message' => 'Full name updated successfully.']);
+        } catch (\Exception $e) {
+            Log::error("Failed to update full name: " . $e->getMessage());
+            return response()->json(['error' => 'Failed to update full name.'], 500);
+        }
+    }
+    /**
      * Get cycle status for a user.
      *
      * @param Request $request
@@ -136,53 +182,6 @@ class UserController extends Controller
         } catch (\Exception $e) {
             Log::error('Error fetching cycle status: ' . $e->getMessage());
             return response()->json(['error' => 'Failed to get cycle status'], 500);
-        }
-    }
-
-    /**
-     * Update user's full name in Firestore.
-     *
-     * @param Request $request
-     * @return \Illuminate\Http\JsonResponse
-     */
-    public function updateFullName(Request $request)
-    {
-        // Validasi input
-        $validator = Validator::make($request->all(), [
-            'firebase_uid' => 'required|string',
-            'fullname' => 'required|string|max:100',
-        ]);
-
-        if ($validator->fails()) {
-            return response()->json(['error' => $validator->errors()->first()], 400);
-        }
-
-        $uid = $request->get('firebase_uid');
-        $newFullName = $request->get('fullname');
-
-        $url = "https://firestore.googleapis.com/v1/projects/{$this->projectId}/databases/(default)/documents/users/{$uid}?updateMask.fieldPaths=fullname";
-
-        $client = new Client();
-
-        try {
-            $response = $client->request('PATCH', $url, [
-                'headers' => [
-                    'Authorization' => 'Bearer ' . $this->accessToken,
-                    'Content-Type' => 'application/json',
-                ],
-                'json' => [
-                    'fields' => [
-                        'fullname' => [
-                            'stringValue' => $newFullName,
-                        ],
-                    ],
-                ],
-            ]);
-
-            return response()->json(['message' => 'Full name updated successfully.']);
-        } catch (\Exception $e) {
-            Log::error("Failed to update full name: " . $e->getMessage());
-            return response()->json(['error' => 'Failed to update full name.'], 500);
         }
     }
 }
