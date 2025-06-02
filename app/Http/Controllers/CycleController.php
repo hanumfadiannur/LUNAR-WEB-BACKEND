@@ -10,9 +10,75 @@ use Illuminate\Support\Facades\Log;
 
 class CycleController extends Controller
 {
+    public function fetchCycleHistory(Request $request)
+    {
+        $uid = $request->get('firebase_uid');
+        if (!$uid) {
+            return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
+        }
 
+        $projectId = config('firebase.project_id');
+        $year = date('Y');
+        $history = [];
+
+        for ($monthIndex = 1; $monthIndex <= 12; $monthIndex++) {
+            $month = str_pad($monthIndex, 2, '0', STR_PAD_LEFT);
+            $url = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$year}/{$month}/active";
+
+            try {
+                $response = Http::get($url);
+
+                if ($response->successful()) {
+                    $data = $response->json();
+                    if (!empty($data['fields'])) {
+                        $fields = $data['fields'];
+
+                        // Parsing tanggal mulai dan tanggal berakhir
+                        $startDate = isset($fields['start_date']['timestampValue'])
+                            ? Carbon::parse($fields['start_date']['timestampValue'])->setTimezone('Asia/Jakarta')
+                            : null;
+
+                        $endDate = isset($fields['end_date']['timestampValue'])
+                            ? Carbon::parse($fields['end_date']['timestampValue'])->setTimezone('Asia/Jakarta')
+                            : null;
+
+                        // Parsing  notes (bentuk map atau array)
+                        $notes = [];
+                        if (isset($fields['notes']['mapValue']['fields'])) {
+                            foreach ($fields['notes']['mapValue']['fields'] as $dateStr => $noteVal) {
+                                $notes[$dateStr] = $noteVal['stringValue'] ?? '';
+                            }
+                        } elseif (isset($fields['notes']['arrayValue']['values'])) {
+                            // Jika notes berupa array, konversi ke map dengan index sebagai key
+                            foreach ($fields['notes']['arrayValue']['values'] as $idx => $noteVal) {
+                                $notes[(string)$idx] = $noteVal['stringValue'] ?? '';
+                            }
+                        }
+
+                        // Hitung lama periode dan selisih hari
+                        $periodLength = $fields['periodLength']['integerValue'] ?? 0;
+                        $daysDifference = $startDate ? abs((int) Carbon::now()->diffInDays($startDate)) : null;
+
+                        // Masukkan ke history
+                        $history[] = [
+                            'month' => $month,
+                            'startDate' => $startDate ? $startDate->format('j F Y') : null,
+                            'periodLength' => $periodLength ? $periodLength . ' days' : null,
+                            'daysAgo' => $daysDifference !== null ? $daysDifference . ' days ago' : null,
+                            'notes' => $notes,
+                        ];
+                    }
+                }
+            } catch (\Exception $e) {
+                Log::warning("Error fetching period for {$year}-{$month}: " . $e->getMessage());
+            }
+        }
+
+        return response()->json(['history' => $history]);
+    }
+    
     /**
-     * Load notifications based on user's cycle data.
+     * Memuat berdasarkan data siklus pengguna.
      *
      * @param Request $request
      * @return \Illuminate\Http\JsonResponse
@@ -108,70 +174,4 @@ class CycleController extends Controller
         }
     }
 
-    public function fetchCycleHistory(Request $request)
-    {
-        $uid = $request->get('firebase_uid');
-        if (!$uid) {
-            return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
-        }
-
-        $projectId = config('firebase.project_id');
-        $year = date('Y');
-        $history = [];
-
-        for ($monthIndex = 1; $monthIndex <= 12; $monthIndex++) {
-            $month = str_pad($monthIndex, 2, '0', STR_PAD_LEFT);
-            $url = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$year}/{$month}/active";
-
-            try {
-                $response = Http::get($url);
-
-                if ($response->successful()) {
-                    $data = $response->json();
-                    if (!empty($data['fields'])) {
-                        $fields = $data['fields'];
-
-                        // Parse start_date & end_date
-                        $startDate = isset($fields['start_date']['timestampValue'])
-                            ? Carbon::parse($fields['start_date']['timestampValue'])->setTimezone('Asia/Jakarta')
-                            : null;
-
-                        $endDate = isset($fields['end_date']['timestampValue'])
-                            ? Carbon::parse($fields['end_date']['timestampValue'])->setTimezone('Asia/Jakarta')
-                            : null;
-
-                        // Parse notes (map or array)
-                        $notes = [];
-                        if (isset($fields['notes']['mapValue']['fields'])) {
-                            foreach ($fields['notes']['mapValue']['fields'] as $dateStr => $noteVal) {
-                                $notes[$dateStr] = $noteVal['stringValue'] ?? '';
-                            }
-                        } elseif (isset($fields['notes']['arrayValue']['values'])) {
-                            // Jika notes berupa array, konversi ke map dengan index sebagai key
-                            foreach ($fields['notes']['arrayValue']['values'] as $idx => $noteVal) {
-                                $notes[(string)$idx] = $noteVal['stringValue'] ?? '';
-                            }
-                        }
-
-                        // Hitung period length dan days difference
-                        $periodLength = $fields['periodLength']['integerValue'] ?? 0;
-                        $daysDifference = $startDate ? abs((int) Carbon::now()->diffInDays($startDate)) : null;
-
-                        // Masukkan ke history
-                        $history[] = [
-                            'month' => $month,
-                            'startDate' => $startDate ? $startDate->format('j F Y') : null,
-                            'periodLength' => $periodLength ? $periodLength . ' days' : null,
-                            'daysAgo' => $daysDifference !== null ? $daysDifference . ' days ago' : null,
-                            'notes' => $notes,
-                        ];
-                    }
-                }
-            } catch (\Exception $e) {
-                Log::warning("Error fetching period for {$year}-{$month}: " . $e->getMessage());
-            }
-        }
-
-        return response()->json(['history' => $history]);
-    }
 }
