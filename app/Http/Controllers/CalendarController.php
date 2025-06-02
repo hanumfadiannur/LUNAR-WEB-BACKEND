@@ -78,7 +78,7 @@ class CalendarController extends Controller
                             ? \Carbon\Carbon::parse($fields['end_date']['timestampValue'])->setTimezone('Asia/Jakarta')->toDateString()
                             : null;
 
-                        // Ambil notes, bisa kosong
+                        // Ambil notes dari dokumen
                         $notes = [];
                         if (isset($fields['notes']['mapValue']['fields'])) {
                             foreach ($fields['notes']['mapValue']['fields'] as $dateStr => $noteVal) {
@@ -86,7 +86,7 @@ class CalendarController extends Controller
                             }
                         }
 
-                        // Tambah event start
+                        // Menambah event start
                         if ($startDate) {
                             $events[] = [
                                 'type' => 'start',
@@ -95,7 +95,7 @@ class CalendarController extends Controller
                             ];
                         }
 
-                        // Tambah event end
+                        // Menambah event end
                         if ($endDate) {
                             $events[] = [
                                 'type' => 'end',
@@ -117,7 +117,7 @@ class CalendarController extends Controller
                     }
                 }
             } catch (\Exception $e) {
-                // Dokumen tidak ada atau error lainnya
+                // Dokumen tidak ditemukan atau ada error lain
                 Log::warning("Error fetching period for {$year}-{$month}: " . $e->getMessage());
             }
         }
@@ -203,7 +203,7 @@ class CalendarController extends Controller
             ];
         }
 
-        // Tambah notes tambahan jika ada
+        // Menambahkan notes jika ada
         foreach ($notes as $dateStr => $note) {
             if ($dateStr !== $predictedStartDate && $dateStr !== $predictedEndDate) {
                 $events[] = [
