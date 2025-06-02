@@ -71,10 +71,11 @@ class CalendarController extends Controller
                         $fields = $data['fields'];
 
                         $startDate = isset($fields['start_date']['timestampValue'])
-                            ? \Carbon\Carbon::parse($fields['start_date']['timestampValue'])->toDateString()
+                            ? \Carbon\Carbon::parse($fields['start_date']['timestampValue'])->setTimezone('Asia/Jakarta')->toDateString()
                             : null;
+
                         $endDate = isset($fields['end_date']['timestampValue'])
-                            ? \Carbon\Carbon::parse($fields['end_date']['timestampValue'])->toDateString()
+                            ? \Carbon\Carbon::parse($fields['end_date']['timestampValue'])->setTimezone('Asia/Jakarta')->toDateString()
                             : null;
 
                         // Ambil notes, bisa kosong
@@ -171,10 +172,10 @@ class CalendarController extends Controller
         $fields = $data['fields'] ?? [];
 
         $predictedStartDate = isset($fields['predicted_start']['timestampValue'])
-            ? \Carbon\Carbon::parse($fields['predicted_start']['timestampValue'])->toDateString()
+            ? \Carbon\Carbon::parse($fields['predicted_start']['timestampValue'])->setTimezone('Asia/Jakarta')->toDateString()
             : null;
         $predictedEndDate = isset($fields['predicted_end']['timestampValue'])
-            ? \Carbon\Carbon::parse($fields['predicted_end']['timestampValue'])->toDateString()
+            ? \Carbon\Carbon::parse($fields['predicted_end']['timestampValue'])->setTimezone('Asia/Jakarta')->toDateString()
             : null;
 
         $notes = [];
@@ -218,265 +219,378 @@ class CalendarController extends Controller
 
 
     /**
-     * Add an event to the user's calendar.
+     * Add an event to the calendar.
+     *
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
      */
     public function addEvent(Request $request)
     {
         $uid = $request->get('firebase_uid');
         if (!$uid) {
+            Log::warning('Missing firebase_uid in request');
             return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
         }
 
-        $request->validate([
-            'event_date' => 'required|date',
-            'event_type' => 'required|string',
-            'note' => 'nullable|string',
-        ]);
+        Log::info("Adding event for UID: $uid");
 
-        $eventDate = $request->input('event_date');
-        $eventType = $request->input('event_type');
-        $note = $request->input('note');
+        $date = $request->date;
+        $eventType = $request->eventType;
+        $cycleLengthFromRequest = $request->cycleLength;
+        $note = $request->note;
 
-        $year = date('Y', strtotime($eventDate));
-        $month = date('m', strtotime($eventDate));
-        $docRef = $this->firestore->collection('users')->document($this->$uid)
-            ->collection('periods')->document($year)->collection($month)->document('active');
+        Log::info("EventType: $eventType | Date: $date | Note: $note");
 
-        $doc = $docRef->snapshot();
+        $projectId = config('firebase.project_id');
+        $userDocUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}";
 
-        if (!$doc->exists()) {
-            $docRef->set([
-                'notes' => [],
-                'start_date' => null,
-                'end_date' => null,
-                'periodLength' => 0,
-            ]);
-        }
+        $carbonDate = \Carbon\Carbon::parse($date);
+        $year = $carbonDate->format('Y');
+        $month = $carbonDate->format('m');
+        $normalizedDate = $carbonDate->format('Y-m-d');
 
-        $data = $doc->data();
-        $notes = $data['notes'] ?? [];
+        $docUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$year}/{$month}/active";
+
+        $fields = [];
 
         if ($eventType === 'start') {
-            $docRef->set([
-                'start_date' => $eventDate,
-                'notes' => array_merge($notes, [$eventDate => $note]),
-            ], ['merge' => true]);
+            $existingDoc = Http::withToken($this->accessToken)->get($docUrl)->json();
+            $existingNotes = $existingDoc['fields']['notes']['mapValue']['fields'] ?? [];
+            $existingNotes[$normalizedDate] = ['stringValue' => $note ?? ''];
+
+            $fields['start_date'] = ['timestampValue' => $carbonDate->toIso8601String()];
+            $fields['notes'] = [
+                'mapValue' => [
+                    'fields' => $existingNotes,
+                ],
+            ];
+
+            $cycleLength = $cycleLengthFromRequest
+                ? intval($cycleLengthFromRequest)
+                : (int) round($this->updateCycleLength($uid, $carbonDate));
+
+
+            // Update cycleLength di user document
+            $userResponse = Http::withToken($this->accessToken)->patch(
+                $userDocUrl . '?updateMask.fieldPaths=cycleLength&updateMask.fieldPaths=lastPeriodStartDate',
+                [
+                    'fields' => [
+                        'cycleLength' => ['integerValue' => $cycleLength],
+                        'lastPeriodStartDate' => ['timestampValue' => $carbonDate->toIso8601String()],
+                    ],
+                ]
+            );
+
+
+            Log::info("User doc cycleLength & lastPeriodStartDate update response", $userResponse->json());
         } elseif ($eventType === 'end') {
-            $docRef->set([
-                'end_date' => $eventDate,
-                'notes' => array_merge($notes, [$eventDate => $note]),
-            ], ['merge' => true]);
-        } elseif ($eventType === 'noteOnly') {
-            $notes[date('Y-m-d', strtotime($eventDate))] = $note;
-            $docRef->set(['notes' => $notes], ['merge' => true]);
+            $existingDoc = Http::withToken($this->accessToken)->get($docUrl)->json();
+            $existingNotes = $existingDoc['fields']['notes']['mapValue']['fields'] ?? [];
+
+
+            $existingNotes[$normalizedDate] = ['stringValue' => $note ?? ''];
+
+            $fields['end_date'] = ['timestampValue' => $carbonDate->toIso8601String()];
+            $fields['notes'] = [
+                'mapValue' => [
+                    'fields' => $existingNotes,
+                ],
+            ];
+
+            // Hitung periodLength jika start_date ada
+            $startDateStr = $existingDoc['fields']['start_date']['timestampValue'] ?? null;
+            if ($startDateStr) {
+                $startDate = \Carbon\Carbon::parse($startDateStr);
+                $periodLength = $startDate->diffInDays($carbonDate) + 1;
+
+                Log::info("Calculated period length in 'end' event: $periodLength");
+
+                // Simpan periodLength juga di dokumen active
+                $fields['periodLength'] = ['integerValue' => $periodLength];
+            }
+        } elseif ($eventType === 'noteOnly' && $note) {
+            $existingDoc = Http::withToken($this->accessToken)->get($docUrl)->json();
+            $existingNotes = $existingDoc['fields']['notes']['mapValue']['fields'] ?? [];
+            $existingNotes[$normalizedDate] = ['stringValue' => $note];
+
+
+            $fields['notes'] = [
+                'mapValue' => [
+                    'fields' => $existingNotes,
+                ],
+            ];
+        } else {
+            Log::error("Invalid event type: $eventType");
+            return response()->json(['error' => 'Invalid event type'], 400);
         }
 
-        return response()->json(['message' => 'Event added successfully.']);
+        $updateMaskQuery = implode('&', array_map(fn($field) => 'updateMask.fieldPaths=' . $field, array_keys($fields)));
+        $patchUrl = $docUrl . '?' . $updateMaskQuery;
+
+        Log::info("Sending PATCH request to: $patchUrl", $fields);
+
+        $response = Http::withToken($this->accessToken)
+            ->patch($patchUrl, ['fields' => $fields]);
+
+        Log::info("Firestore response", $response->json());
+
+        if ($response->failed()) {
+            Log::error('Failed to update period document', ['response' => $response->body()]);
+            return response()->json([
+                'error' => 'Failed to update period document',
+                'details' => $response->body(),
+            ], 500);
+        }
+
+        if ($eventType === 'end') {
+            $activeDoc = Http::withToken($this->accessToken)->get($docUrl)->json();
+            Log::info("Fetched active period doc", $activeDoc);
+
+            $startDateStr = $activeDoc['fields']['start_date']['timestampValue'] ?? null;
+
+            if ($startDateStr) {
+                $startDate = \Carbon\Carbon::parse($startDateStr);
+                $periodLength = $startDate->diffInDays($carbonDate) + 1;
+
+                Log::info("Calculated period length: $periodLength");
+
+                $userUpdate = [
+                    'lastPeriodStartDate' => ['timestampValue' => $startDate->toIso8601String()],
+                    'lastPeriodEndDate' => ['timestampValue' => $carbonDate->toIso8601String()],
+                    'periodLength' => ['integerValue' => $periodLength],
+                ];
+
+                $updateFields = array_keys($userUpdate); // ['lastPeriodStartDate', 'lastPeriodEndDate', 'periodLength']
+                $updateMask = implode('&', array_map(fn($field) => 'updateMask.fieldPaths=' . $field, $updateFields));
+                $userUpdateUrl = $userDocUrl . '?' . $updateMask;
+
+                Http::withToken($this->accessToken)->patch($userUpdateUrl, [
+                    'fields' => $userUpdate,
+                ]);
+
+
+                $userDoc = Http::withToken($this->accessToken)->get($userDocUrl)->json();
+                $cycleLength = (int) $userDoc['fields']['cycleLength']['integerValue'];
+
+
+                Log::info("Cycle length from user doc: $cycleLength");
+
+                $predictedStart = $startDate->copy()->addDays($cycleLength);
+                $periodLength = (int) $periodLength; // ensure integer
+                $predictedEnd = $predictedStart->copy()->addDays($periodLength - 1);
+
+
+                $predYear = $predictedStart->format('Y');
+                $predMonth = $predictedStart->format('m');
+
+                $predictionDocUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/predictions/{$predYear}/{$predMonth}/active";
+
+                Log::info("Posting predicted dates to: $predictionDocUrl", [
+                    'predicted_start' => $predictedStart->toIso8601String(),
+                    'predicted_end' => $predictedEnd->toIso8601String(),
+                ]);
+
+                Http::withToken($this->accessToken)->patch($predictionDocUrl, [
+                    'fields' => [
+                        'predicted_start' => ['timestampValue' => $predictedStart->toIso8601String()],
+                        'predicted_end' => ['timestampValue' => $predictedEnd->toIso8601String()],
+                        'created_at' => ['timestampValue' => now()->toIso8601String()],
+                        'is_confirmed' => ['booleanValue' => false],
+                    ],
+                ]);
+            }
+        }
+
+        Log::info('Event added successfully');
+        return response()->json(['message' => 'Event added successfully']);
     }
+
+    /**
+     * Update cycle length based on previous or next month.
+     */
+    protected function updateCycleLength(string $uid, \Carbon\Carbon $currentStartDate)
+    {
+        $projectId = config('firebase.project_id');
+        $userRefBase = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods";
+
+        $cycleLength = 27; // fallback
+
+        // Cek bulan sebelumnya
+        $prevMonth = $currentStartDate->copy()->subMonth();
+        $prevYearStr = $prevMonth->format('Y');
+        $prevMonthStr = $prevMonth->format('m');
+        $prevDocUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$prevYearStr}/{$prevMonthStr}/active";
+
+        $response = Http::withToken($this->accessToken)->get($prevDocUrl);
+        $prevStartDate = null;
+
+        if ($response->successful()) {
+            $data = $response->json();
+            if (isset($data['fields']['start_date']['timestampValue'])) {
+                $prevStartDate = \Carbon\Carbon::parse($data['fields']['start_date']['timestampValue']);
+            }
+        }
+
+        Log::info('currentStartDate: ' . $currentStartDate->toDateTimeString());
+        if ($prevStartDate) {
+            Log::info('prevStartDate: ' . $prevStartDate->toDateTimeString());
+            Log::info('diffInDays (current - prev): ' .    $cycleLength = $prevStartDate->diffInDays($currentStartDate));
+        } else {
+            Log::info('prevStartDate not found');
+
+            // Cek bulan berikutnya
+            $nextMonth = $currentStartDate->copy()->addMonth();
+            $nextYearStr = $nextMonth->format('Y');
+            $nextMonthStr = $nextMonth->format('m');
+            $nextDocUrl = "{$userRefBase}/{$nextYearStr}/{$nextMonthStr}/active";
+
+            $response = Http::withToken($this->accessToken)->get($nextDocUrl);
+            if ($response->successful()) {
+                $data = $response->json();
+                if (isset($data['fields']['start_date']['timestampValue'])) {
+                    $nextStartDate = \Carbon\Carbon::parse($data['fields']['start_date']['timestampValue']);
+                    $cycleLength = $nextStartDate->diffInDays($currentStartDate);
+                }
+            }
+        }
+
+        return $cycleLength;
+    }
+
 
     /**
      * Remove an event and its notes.
      */
-    public function removeEventAndNotes(Request $request)
+    public function removeEvent(Request $request)
     {
         $uid = $request->get('firebase_uid');
         if (!$uid) {
-            return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
-        }
-        $request->validate([
-            'event_date' => 'required|date',
-        ]);
-
-        $eventDate = $request->input('event_date');
-        $year = date('Y', strtotime($eventDate));
-        $month = date('m', strtotime($eventDate));
-        $docRef = $this->firestore->collection('users')->document($this->$uid)
-            ->collection('periods')->document($year)->collection($month)->document('active');
-
-        $doc = $docRef->snapshot();
-
-        if ($doc->exists()) {
-            $data = $doc->data();
-            $notes = $data['notes'] ?? [];
-            unset($notes[date('Y-m-d', strtotime($eventDate))]);
-
-            $docRef->set(['notes' => $notes], ['merge' => true]);
-            return response()->json(['message' => 'Event and notes removed successfully.']);
-        }
-
-        return response()->json(['message' => 'Document does not exist.'], 404);
-    }
-
-    /**
-     * Mark the start and end of a period.
-     *
-     * @param Request $request
-     * @return \Illuminate\Http\JsonResponse
-     */
-    public function markStartEndPeriod(Request $request)
-    {
-
-        $uid = $request->get('firebase_uid');
-        if (!$uid) {
+            Log::warning('Unauthorized access attempt: missing user ID');
             return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
         }
 
-        $request->validate([
-            'start_date' => 'required|date',
-            'note' => 'nullable|string',
-        ]);
-
-        $startDate = $request->input('start_date');
-        $note = $request->input('note', '');
-        $endDate = date('Y-m-d', strtotime($startDate . ' + 4 days'));
-
-        // Fetch user data from Firestore
-        $userDoc = $this->firestore->collection('users')->document($this->$uid)->snapshot();
-
-        if (!$userDoc->exists()) {
-            return response()->json(['message' => 'User  data not found.'], 404);
+        $date = $request->date;
+        if (!$date) {
+            Log::warning("Remove event called without date. UID: {$uid}");
+            return response()->json(['error' => 'Missing date'], 400);
         }
 
-        $data = $userDoc->data();
-        $periodLength = $data['periodLength'] ?? 5;
+        Log::info("Remove event requested. UID: {$uid}, Date: {$date}");
 
-        // Add start and end events
-        $this->addEventToFirestore($startDate, 'start', $note);
-        $this->addEventToFirestore($endDate, 'end');
+        $projectId = config('firebase.project_id');
+        $carbonDate = \Carbon\Carbon::parse($date);
+        $year = $carbonDate->format('Y');
+        $month = $carbonDate->format('m');
+        $normalizedDate = $carbonDate->format('Y-m-d');
 
-        // Save to Firestore for the active period
-        $year = date('Y', strtotime($startDate));
-        $month = date('m', strtotime($startDate));
+        $docUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$year}/{$month}/active";
 
-        // Fetch existing notes
-        $existingNotesSnap = $this->firestore->collection('users')->document($this->$uid)
-            ->collection('periods')->document($year)->collection($month)->document('active')->snapshot();
+        $existingDoc = Http::withToken($this->accessToken)->get($docUrl);
 
-        $existingNotes = [];
-        if ($existingNotesSnap->exists()) {
-            $existingNotes = $existingNotesSnap->data()['notes'] ?? [];
+        if ($existingDoc->failed()) {
+            return response()->json(['error' => 'Failed to fetch document'], 500);
         }
 
-        // Filter notes between start_date and end_date
-        $filteredNotes = [];
-        foreach ($existingNotes as $date => $noteValue) {
-            $noteDate = date('Y-m-d', strtotime($date));
-            if (
-                $noteDate > date('Y-m-d', strtotime($startDate . ' -1 day')) &&
-                $noteDate < date('Y-m-d', strtotime($endDate . ' +1 day'))
-            ) {
-                $filteredNotes[$date] = $noteValue;
+        $docData = $existingDoc->json();
+
+        $emptyNotes = (object)[];
+
+        $startDate = $docData['fields']['start_date']['timestampValue'] ?? null;
+        $endDate = $docData['fields']['end_date']['timestampValue'] ?? null;
+        $fields = [
+            'notes' => ['mapValue' => ['fields' => $emptyNotes]],
+            'periodLength' => ['nullValue' => null],
+        ];
+
+        if ($startDate) {
+            $startDateCarbon = \Carbon\Carbon::parse($startDate)->setTimezone('Asia/Jakarta');
+            if ($startDateCarbon->format('Y-m-d') === $normalizedDate) {
+                Log::info('Start date matches, resetting start_date and end_date to null');
+                $fields['start_date'] = ['nullValue' => null];
+                $fields['end_date'] = ['nullValue' => null];
             }
         }
 
-        // Add new note if provided
-        if (!empty($note)) {
-            $filteredNotes[date('Y-m-d', strtotime($startDate))] = $note;
+        if ($endDate) {
+            $endDateCarbon = \Carbon\Carbon::parse($endDate)->setTimezone('Asia/Jakarta');
+            if ($endDateCarbon->format('Y-m-d') === $normalizedDate) {
+                Log::info('End date matches, resetting end_date to null');
+                $fields['end_date'] = ['nullValue' => null];
+            }
         }
 
-        // Update Firestore with start_date, end_date, and notes
-        $this->firestore->collection('users')->document($this->$uid)
-            ->collection('periods')->document($year)->collection($month)->document('active')
-            ->set([
-                'start_date' => $startDate,
-                'end_date' => $endDate,
-                'notes' => $filteredNotes,
-            ], ['merge' => true]);
+        $updateMaskParts = [];
+        foreach (array_keys($fields) as $field) {
+            $updateMaskParts[] = "updateMask.fieldPaths={$field}";
+        }
+        $updateMask = implode('&', $updateMaskParts);
 
-        // Update user data for cycle length and last period dates
-        $this->updateUserPeriodData($startDate, $endDate, $periodLength);
+        $patchUrl = $docUrl . '?' . $updateMask;
+        $response = Http::withToken($this->accessToken)->patch($patchUrl, ['fields' => $fields]);
 
-        return response()->json(['message' => 'Period marked successfully.']);
+        if ($response->failed()) {
+            return response()->json(['error' => 'Failed to update document', 'details' => $response->body()], 500);
+        }
+        return response()->json(['message' => 'Event and notes removed successfully']);
     }
 
     /**
-     * Add an event to Firestore.
-     *
-     * @param string $eventDate
-     * @param string $eventType
-     * @param string|null $note
+     * Remove a note for a specific date.
      */
-    private function addEventToFirestore($eventDate, $eventType, $note = null)
+    public function removeNote(Request $request)
     {
-        $uid = request()->get('firebase_uid');
+        $uid = $request->get('firebase_uid');
+        $date = $request->date;
+
         if (!$uid) {
             return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
         }
-
-        $year = date('Y', strtotime($eventDate));
-        $month = date('m', strtotime($eventDate));
-        $docRef = $this->firestore->collection('users')->document($this->$uid)
-            ->collection('periods')->document($year)->collection($month)->document('active');
-
-        $doc = $docRef->snapshot();
-
-        if (!$doc->exists()) {
-            $docRef->set([
-                'notes' => [],
-                'start_date' => null,
-                'end_date' => null,
-                'periodLength' => 0,
-            ]);
+        if (!$date) {
+            return response()->json(['error' => 'Missing date'], 400);
         }
 
-        $notes = $doc->data()['notes'] ?? [];
-        if ($eventType === 'start') {
-            $docRef->set([
-                'start_date' => $eventDate,
-                'notes' => array_merge($notes, [$eventDate => $note]),
-            ], ['merge' => true]);
-        } elseif ($eventType === 'end') {
-            $docRef->set([
-                'end_date' => $eventDate,
-                'notes' => array_merge($notes, [$eventDate => $note]),
-            ], ['merge' => true]);
+        $carbonDate = \Carbon\Carbon::parse($date);
+        $year = $carbonDate->format('Y');
+        $month = $carbonDate->format('m');
+        $formattedDate = $carbonDate->format('Y-m-d');
+
+        $projectId = config('firebase.project_id');
+        $docUrl = "https://firestore.googleapis.com/v1/projects/{$projectId}/databases/(default)/documents/users/{$uid}/periods/{$year}/{$month}/active";
+
+        // Ambil dokumen Firestore
+        $existingDoc = Http::withToken($this->accessToken)->get($docUrl);
+        if ($existingDoc->failed()) {
+            return response()->json(['error' => 'Failed to fetch document'], 500);
         }
-    }
+        $docData = $existingDoc->json();
 
-    /**
-     * Update user period data in Firestore.
-     *
-     * @param string $startDate
-     * @param string $endDate
-     * @param int $periodLength
-     */
-    private function updateUserPeriodData($startDate, $endDate, $periodLength)
-    {
+        // Ambil notes map (object) dari dokumen
+        $notes = $docData['fields']['notes']['mapValue']['fields'] ?? [];
 
-        $uid = request()->get('firebase_uid');
-        if (!$uid) {
-            return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
+        // Hapus key tanggal yg diinginkan dari notes
+        if (array_key_exists($formattedDate, $notes)) {
+            unset($notes[$formattedDate]);
+
+            // Persiapkan data update
+            $fields = [
+                'notes' => ['mapValue' => ['fields' => $notes]]
+            ];
+
+            // Build updateMask
+            $updateMaskParts = ['updateMask.fieldPaths=notes'];
+            $updateMask = implode('&', $updateMaskParts);
+
+            $patchUrl = $docUrl . '?' . $updateMask;
+
+            // PATCH request update notes
+            $response = Http::withToken($this->accessToken)->patch($patchUrl, ['fields' => $fields]);
+
+            if ($response->failed()) {
+                return response()->json(['error' => 'Failed to update notes', 'details' => $response->body()], 500);
+            }
+            return response()->json(['message' => 'Note removed successfully']);
+        } else {
+            return response()->json(['message' => 'Note not found for the given date']);
         }
-        $userRef = $this->firestore->collection('users')->document($this->$uid);
-        $userDoc = $userRef->snapshot();
-
-        if ($userDoc->exists()) {
-            $lastStartDate = $userDoc->data()['lastPeriodStartDate'] ?? null;
-            $lastEndDate = $userDoc->data()['lastPeriodEndDate'] ?? null;
-
-            $userRef->update([
-                'lastPeriodStartDate' => $startDate,
-                'lastPeriodEndDate' => $endDate,
-                'cycleLength' => $periodLength,
-            ]);
-        }
-    }
-
-    /**
-     * Fetch user data.
-     */
-    public function fetchUserData()
-    {
-        $uid = request()->get('firebase_uid');
-        if (!$uid) {
-            return response()->json(['error' => 'Unauthorized: missing user ID'], 401);
-        }
-        $userDoc = $this->firestore->collection('users')->document($this->$uid)->snapshot();
-
-        if ($userDoc->exists()) {
-            return response()->json($userDoc->data());
-        }
-
-        return response()->json(['message' => 'User  data not found.'], 404);
     }
 }

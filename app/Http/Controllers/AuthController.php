@@ -189,7 +189,12 @@ class AuthController extends Controller
             );
             $doc = json_decode($check->getBody(), true);
             $fields = $doc['fields'] ?? [];
-            $hasCycleData = !($fields['lastPeriodStartDate'] !== null && $fields['lastPeriodEndDate'] !== null);
+            $hasCycleData = (
+                isset($fields['lastPeriodStartDate']['timestampValue']) &&
+                isset($fields['lastPeriodEndDate']['timestampValue']) &&
+                !empty($fields['lastPeriodStartDate']['timestampValue']) &&
+                !empty($fields['lastPeriodEndDate']['timestampValue'])
+            );
 
 
 
